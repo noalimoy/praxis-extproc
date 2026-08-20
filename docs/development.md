@@ -178,11 +178,14 @@ make container          # debug binary (in-container)
 make container-release  # release binary (in-container, stripped)
 ```
 
-Multi-stage image: `ubi10/ubi` builder (rustup, native
-cargo on the host platform) and `ubi10/ubi-minimal`
-runtime. Builds for the host architecture. The runtime
-image runs as UID 1001 (OpenShift-friendly numeric
-non-root user).
+Multi-stage image: `ubi9/ubi` builder (AppStream
+`rust-toolset` 1.92, `OPENSSL_NO_VENDOR=1` so the
+binary links UBI9 `libssl.so.3`) and
+`ubi9/ubi-minimal` plus `openssl-libs` at runtime.
+Cargo is invoked with `--ignore-rust-version` because
+crates declare rust-version 1.96. Builds for the host
+architecture. The runtime image runs as UID 1001
+(OpenShift-friendly numeric non-root user).
 
 ## CI
 
