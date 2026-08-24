@@ -83,6 +83,7 @@ pub(crate) fn request_headers(mutation: Option<HeaderMutation>) -> ProcessingRes
         response: Some(Response::RequestHeaders(HeadersResponse {
             response: Some(CommonResponse {
                 status: ResponseStatus::Continue.into(),
+                clear_route_cache: mutation.is_some(),
                 header_mutation: mutation,
                 ..Default::default()
             }),
