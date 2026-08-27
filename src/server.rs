@@ -51,12 +51,11 @@ struct ProtocolConfig {
     response_body_mode: BodyMode,
     /// Whether body is sent immediately without waiting for header response.
     ///
-    /// When `true`, Envoy sends body chunks immediately after headers without
-    /// waiting for the header response. When `false`, Envoy buffers body data
-    /// until the header response is received.
+    /// Only applies to `STREAMED` body mode per Envoy spec; ignored for other
+    /// modes. `FULL_DUPLEX_STREAMED` inherently streams body without waiting.
     ///
     /// See: `ProtocolConfiguration.send_body_without_waiting_for_header_response`
-    #[expect(dead_code, reason = "captured for future Header deferral implementation")]
+    #[expect(dead_code, reason = "captured for future STREAMED delayed-response implementation")]
     send_body_without_waiting: bool,
 }
 
@@ -346,11 +345,11 @@ impl EosTracker {
 // Phase Handlers
 // -----------------------------------------------------------------------------
 
-/// Handle request headers: parse into [`Request`] and respond immediately.
+/// Handle request headers: parse into [`Request`] and route by body mode.
 ///
-/// When body is expected (`end_of_stream=false`), the pipeline runs
-/// later when the body arrives. We still respond to headers now
-/// because Envoy waits for a headers response before sending body.
+/// For `BUFFERED`, sends an empty `HeadersResponse` — pipeline runs at body EOS.
+/// For `STREAMED`, runs filters early and sends mutations in `HeadersResponse`.
+/// For `FDS`, returns no response — body arrives without waiting.
 ///
 /// [`Request`]: praxis_filter::Request
 async fn handle_request_headers(
@@ -369,11 +368,11 @@ async fn handle_request_headers(
         return run_request_pipeline(RequestPhase::Headers, pipeline, state).await;
     }
 
-    if state.protocol_config.request_body_mode == BodyMode::Streamed {
-        return run_request_header_filters_early(pipeline, state).await;
+    match state.protocol_config.request_body_mode {
+        BodyMode::FullDuplexStreamed => Ok(Vec::new()),
+        BodyMode::Streamed => run_request_header_filters_early(pipeline, state).await,
+        _ => Ok(vec![response::request_headers(None)]),
     }
-
-    Ok(vec![response::request_headers(None)])
 }
 
 /// Handle request body: accumulate chunks, run pipeline on EOS.
@@ -405,9 +404,11 @@ async fn handle_request_body(
 
 /// Handle response headers: run response filters and respond with mutations.
 ///
-/// Response header mutations must be sent in this phase because Envoy
-/// sends headers to the client after receiving our reply. Body-phase
-/// mutations on headers are too late.
+/// For `BUFFERED`, runs filters early and defers mutations to body phase
+/// (Envoy honours `CommonResponse.header_mutation` on body responses).
+/// For `STREAMED`, runs filters early and sends mutations immediately
+/// (Envoy ignores header mutations on body responses for non-`BUFFERED`).
+/// For `FDS`, returns no response — deferred to body phase.
 async fn handle_response_headers(
     pipeline: &FilterPipeline,
     headers: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
@@ -424,7 +425,11 @@ async fn handle_response_headers(
         return run_response_pipeline(ResponsePhase::Headers, pipeline, state).await;
     }
 
-    run_response_header_filters_early(pipeline, state).await
+    match state.protocol_config.response_body_mode {
+        BodyMode::FullDuplexStreamed => Ok(Vec::new()),
+        BodyMode::Streamed => run_response_header_filters_early(pipeline, state, true).await,
+        _ => run_response_header_filters_early(pipeline, state, false).await,
+    }
 }
 
 /// Handle response body: accumulate chunks, run pipeline on EOS.
@@ -493,17 +498,12 @@ async fn run_request_pipeline(
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
 
-    match phase {
-        RequestPhase::Headers => Ok(vec![response::request_headers(mutation)]),
-        RequestPhase::Body => {
-            let body_data = body_data_if_present(&state.request_body);
-            Ok(response::request_body(
-                body_data,
-                mutation,
-                state.protocol_config.request_body_mode,
-            ))
-        },
-    }
+    Ok(build_request_for_phase(
+        phase,
+        mutation,
+        body_data_if_present(&state.request_body),
+        state.protocol_config.request_body_mode,
+    ))
 }
 
 /// Response filter execution phase.
@@ -563,7 +563,7 @@ async fn run_response_pipeline(
     Ok(build_response_for_phase(
         phase,
         mutation,
-        &state.response_body,
+        body_data_if_present(&state.response_body),
         state.protocol_config.response_body_mode,
     ))
 }
@@ -594,19 +594,39 @@ async fn execute_response_pipeline_and_body_filters(
     Ok(body_reject)
 }
 
-/// Build appropriate response based on phase.
+/// Build request-phase responses, prepending `HeadersResponse` in FDS mode.
+fn build_request_for_phase(
+    phase: RequestPhase,
+    mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    body: Option<&[u8]>,
+    mode: BodyMode,
+) -> Vec<ProcessingResponse> {
+    match (phase, mode) {
+        (RequestPhase::Headers, _) => vec![response::request_headers(mutation)],
+        (RequestPhase::Body, BodyMode::FullDuplexStreamed) => {
+            let mut r = vec![response::request_headers(mutation)];
+            r.extend(response::request_body(body, None, mode));
+            r
+        },
+        (RequestPhase::Body, _) => response::request_body(body, mutation, mode),
+    }
+}
+
+/// Build response-phase responses, prepending `ResponseHeadersResponse` in FDS mode.
 fn build_response_for_phase(
     phase: ResponsePhase,
     mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
-    response_body: &[u8],
-    body_mode: BodyMode,
+    body: Option<&[u8]>,
+    mode: BodyMode,
 ) -> Vec<ProcessingResponse> {
-    match phase {
-        ResponsePhase::Headers => vec![response::response_headers(mutation)],
-        ResponsePhase::Body => {
-            let body_data = body_data_if_present(response_body);
-            response::response_body(body_data, mutation, body_mode)
+    match (phase, mode) {
+        (ResponsePhase::Headers, _) => vec![response::response_headers(mutation)],
+        (ResponsePhase::Body, BodyMode::FullDuplexStreamed) => {
+            let mut r = vec![response::response_headers(mutation)];
+            r.extend(response::response_body(body, None, mode));
+            r
         },
+        (ResponsePhase::Body, _) => response::response_body(body, mutation, mode),
     }
 }
 
@@ -617,7 +637,8 @@ fn build_response_for_phase(
 /// Process a single body chunk in `STREAMED` mode.
 ///
 /// Runs body filters on the chunk and responds immediately.
-/// Deferred header mutations are included on the first chunk's response.
+/// Header mutations are sent at header time for `STREAMED`, so
+/// `deferred_*_header_mutation` will be `None` here.
 #[expect(
     clippy::too_many_lines,
     reason = "Reusable for request and response processing, better than 2 different functions"
@@ -654,25 +675,33 @@ async fn process_streamed_body_chunk(
     state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
-    let mutation = if is_request {
-        state.deferred_request_header_mutation.take()
+    let (mutation, body_mode) = if is_request {
+        (
+            state.deferred_request_header_mutation.take(),
+            state.protocol_config.request_body_mode,
+        )
     } else {
-        state.deferred_response_header_mutation.take()
+        (
+            state.deferred_response_header_mutation.take(),
+            state.protocol_config.response_body_mode,
+        )
     };
+
     let body_data = body_data_if_present(&chunk);
-    let build = if is_request {
-        response::request_body
+    let responses = if is_request {
+        response::request_body(body_data, mutation, body_mode)
     } else {
-        response::response_body
+        response::response_body(body_data, mutation, body_mode)
     };
-    Ok(build(body_data, mutation, BodyMode::Streamed))
+    Ok(responses)
 }
 
-/// Run request filters at header time and defer mutations until body phase.
+/// Run request filters at header time and send mutations immediately.
 ///
-/// Used in `STREAMED` body mode where each body chunk must receive an
-/// immediate response. The pipeline runs once here; body filters run
-/// per-chunk in [`process_streamed_body_chunk`].
+/// Used in `STREAMED` body mode. Mutations are sent in the
+/// `HeadersResponse` because Envoy ignores `CommonResponse.header_mutation`
+/// on body responses for non-`BUFFERED` modes.
+/// Body filters run separately per-chunk.
 async fn run_request_header_filters_early(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
@@ -690,19 +719,21 @@ async fn run_request_header_filters_early(
     state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
-    state.deferred_request_header_mutation = adapter::collect_request_header_mutations(&ctx);
+    let mutation = adapter::collect_request_header_mutations(&ctx);
 
-    Ok(vec![response::request_headers(None)])
+    Ok(vec![response::request_headers(mutation)])
 }
 
-/// Run response filters at header time and defer mutations until body phase.
+/// Run response filters at header time before body arrives.
 ///
-/// This executes the response pipeline early but defers header mutations
-/// to the body phase where they will be merged with any body-phase mutations.
-/// Body processing runs separately when the body arrives.
+/// When `send_mutations` is true (`STREAMED`), mutations are sent immediately
+/// in the `ResponseHeadersResponse` — Envoy ignores `CommonResponse.header_mutation`
+/// on body responses for non-`BUFFERED` modes.
+/// When false (`BUFFERED`), mutations are deferred to the body phase.
 async fn run_response_header_filters_early(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
+    send_mutations: bool,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
         return Ok(vec![response::response_headers(None)]);
@@ -726,8 +757,11 @@ async fn run_response_header_filters_early(
     state.response_filters_executed = true;
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
 
-    state.deferred_response_header_mutation = mutation;
+    if send_mutations {
+        return Ok(vec![response::response_headers(mutation)]);
+    }
 
+    state.deferred_response_header_mutation = mutation;
     Ok(vec![response::response_headers(None)])
 }
 
@@ -861,10 +895,11 @@ struct StreamState {
     /// Protocol configuration parsed from Envoy's first message.
     protocol_config: ProtocolConfig,
 
-    /// Deferred request header mutation for STREAMED body mode.
+    /// Deferred request header mutation (currently unused — request mutations
+    /// are sent at header time for both STREAMED and BUFFERED).
     deferred_request_header_mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
 
-    /// Deferred response header mutation when body is expected.
+    /// Deferred response header mutation for BUFFERED mode with body pending.
     deferred_response_header_mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
 }
 
