@@ -5,6 +5,7 @@
 	container container-release images kind-up kind-down smoke-test \
 	dev-env dev-push dev-integration \
 	manifests-demo manifests-odh \
+	e2e-setup e2e-teardown e2e-test \
 	setup-hooks \
 	help
 
@@ -86,6 +87,7 @@ endif
 
 container: | require-container-engine
 	$(CONTAINER_ENGINE) build \
+		--no-cache \
 		--build-arg CARGO_PROFILE=debug \
 		-t $(EXTPROC_IMAGE) \
 		-f Containerfile \
@@ -116,6 +118,27 @@ kind-down:
 smoke-test:
 	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) \
 	bash hack/smoke-test.sh
+
+# ---------------------------------------------------------------------------
+# E2E (Forge)
+# ---------------------------------------------------------------------------
+
+FORGE_BIN    ?= praxis-forge
+FORGE_CONFIG := forge.yaml
+INFERENCE_SIM_IMAGE ?= ghcr.io/llm-d/llm-d-inference-sim:v0.8.2
+FORGE_CMD = "$(FORGE_BIN)" --config "$(FORGE_CONFIG)" --runtime "$(notdir $(CONTAINER_ENGINE))"
+
+e2e-setup: images
+	$(FORGE_CMD) cluster create e2e
+	$(FORGE_CMD) cluster load-image e2e "$(EXTPROC_IMAGE)"
+	$(FORGE_CMD) stack apply e2e
+
+e2e-teardown:
+	$(FORGE_CMD) cluster delete e2e
+
+e2e-test:
+	GATEWAY_URL=http://$$(kubectl --context kind-praxis-e2e -n istio-system get svc e2e-gateway-istio -o jsonpath='{.status.loadBalancer.ingress[0].ip}') \
+	cargo test --features k8s-e2e --test k8s_e2e $(if $(V),-- --nocapture,)
 
 # ---------------------------------------------------------------------------
 # Iterative Development
@@ -194,6 +217,11 @@ help:
 	@echo "Manifests:"
 	@echo "  manifests-demo   kubectl kustomize deploy/overlays/demo"
 	@echo "  manifests-odh    kubectl kustomize deploy/overlays/odh"
+	@echo ""
+	@echo "E2E (Forge):"
+	@echo "  e2e-setup        create Kind cluster + install all stacks"
+	@echo "  e2e-teardown     delete Kind e2e cluster"
+	@echo "  e2e-test         run k8s e2e tests against cluster"
 	@echo ""
 	@echo "Dev Setup:"
 	@echo "  setup-hooks      install git pre-commit hook"
