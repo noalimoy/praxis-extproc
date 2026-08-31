@@ -6,7 +6,9 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 CLUSTER_NAME="${KIND_CLUSTER_NAME:-praxis-extproc}"
-EXTPROC_IMAGE="${EXTPROC_IMAGE:-praxis-extproc:dev}"
+# Fully-qualified: podman tags local builds `localhost/...`, which won't match
+# the `docker.io/library/...` Kubernetes resolves to under `imagePullPolicy: Never`.
+EXTPROC_IMAGE="${EXTPROC_IMAGE:-docker.io/library/praxis-extproc:dev}"
 SAIL_REPO="https://istio-ecosystem.github.io/sail-operator"
 GWAPI_VERSION="v1.5.1"
 METALLB_VERSION="v0.14.9"
