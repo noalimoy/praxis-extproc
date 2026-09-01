@@ -1235,18 +1235,33 @@ async fn full_duplex_headers_prepended_only_to_first_chunk() {
         "first response should be deferred HeadersResponse, got: {hdr_msg:?}"
     );
     let first_body = next_full_duplex_msg(&mut response_stream).await;
-    assert!(
-        matches!(first_body.response, Some(RespVariant::RequestBody(_))),
-        "first chunk's body response expected, got: {first_body:?}"
+    assert_eq!(
+        streamed_eos(&first_body),
+        Some(false),
+        "first chunk must propagate source EOS=false, got: {first_body:?}"
     );
 
-    // Subsequent chunks: body responses only, never preceded by RequestHeaders.
-    for chunk in 1..eos_flags.len() {
+    // Subsequent chunks: body responses only, never preceded by RequestHeaders,
+    // and each must propagate the source chunk's own end_of_stream flag.
+    for (chunk, &eos) in eos_flags.iter().enumerate().skip(1) {
         let msg = next_full_duplex_msg(&mut response_stream).await;
-        assert!(
-            matches!(msg.response, Some(RespVariant::RequestBody(_))),
-            "chunk {chunk} should yield a body response with no header, got: {msg:?}"
+        assert_eq!(
+            streamed_eos(&msg),
+            Some(eos),
+            "chunk {chunk} should propagate source EOS={eos}, got: {msg:?}"
         );
+    }
+}
+
+/// Extract `end_of_stream` from a streamed request-body response, if present.
+fn streamed_eos(msg: &ProcessingResponse) -> Option<bool> {
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
+    match msg.response.as_ref()? {
+        RespVariant::RequestBody(b) => match b.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()? {
+            body_mutation::Mutation::StreamedResponse(s) => Some(s.end_of_stream),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

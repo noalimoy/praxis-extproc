@@ -640,10 +640,11 @@ fn build_request_for_phase(
         (RequestPhase::Headers, _) => vec![response::request_headers(mutation)],
         (RequestPhase::Body, BodyMode::FullDuplexStreamed) => {
             let mut r = vec![response::request_headers(mutation)];
-            r.extend(response::request_body(body, None, mode));
+            // Assembled body emitted at EOS.
+            r.extend(response::request_body(body, None, mode, true));
             r
         },
-        (RequestPhase::Body, _) => response::request_body(body, mutation, mode),
+        (RequestPhase::Body, _) => response::request_body(body, mutation, mode, true),
     }
 }
 
@@ -658,10 +659,11 @@ fn build_response_for_phase(
         (ResponsePhase::Headers, _) => vec![response::response_headers(mutation)],
         (ResponsePhase::Body, BodyMode::FullDuplexStreamed) => {
             let mut r = vec![response::response_headers(mutation)];
-            r.extend(response::response_body(body, None, mode));
+            // Assembled body emitted at EOS.
+            r.extend(response::response_body(body, None, mode, true));
             r
         },
-        (ResponsePhase::Body, _) => response::response_body(body, mutation, mode),
+        (ResponsePhase::Body, _) => response::response_body(body, mutation, mode, true),
     }
 }
 
@@ -681,10 +683,13 @@ fn passthrough_chunk(
     is_request: bool,
 ) -> Vec<ProcessingResponse> {
     let body_data = body_data_if_present(&body.body);
+    // Propagate the source chunk's EOS: Envoy may split a body across multiple
+    // messages, and the wire format (streamed vs. replacement) is chosen by
+    // `mode` inside `response::request_body`/`response_body`.
     let body_responses = if is_request {
-        response::request_body(body_data, None, mode)
+        response::request_body(body_data, None, mode, body.end_of_stream)
     } else {
-        response::response_body(body_data, None, mode)
+        response::response_body(body_data, None, mode, body.end_of_stream)
     };
 
     if !state.header_state.take_first_chunk(is_request) {
@@ -761,9 +766,9 @@ async fn process_streamed_body_chunk(
 
     let body_data = body_data_if_present(&chunk);
     let responses = if is_request {
-        response::request_body(body_data, mutation, body_mode)
+        response::request_body(body_data, mutation, body_mode, eos)
     } else {
-        response::response_body(body_data, mutation, body_mode)
+        response::response_body(body_data, mutation, body_mode, eos)
     };
     Ok(responses)
 }
