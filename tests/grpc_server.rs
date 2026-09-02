@@ -1197,6 +1197,84 @@ async fn full_duplex_multi_chunk_request_body() {
 }
 
 #[tokio::test]
+async fn full_duplex_headers_prepended_only_to_first_chunk() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    let mut headers = make_request_headers("POST", "/upload", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 4,
+        response_body_mode: 2,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.unwrap();
+
+    // FDS: no response at header time. Send three discrete body messages;
+    // small bodies keep a 1:1 message-to-chunk mapping (no server-side split).
+    let eos_flags = [false, false, true];
+    for (i, eos) in eos_flags.iter().enumerate() {
+        tx.send(ProcessingRequest {
+            request: Some(ReqVariant::RequestBody(HttpBody {
+                body: vec![u8::try_from(i).expect("should expect chunks"); 16],
+                end_of_stream: *eos,
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    // First chunk: deferred RequestHeaders must precede the body response.
+    let hdr_msg = next_full_duplex_msg(&mut response_stream).await;
+    assert!(
+        matches!(hdr_msg.response, Some(RespVariant::RequestHeaders(_))),
+        "first response should be deferred HeadersResponse, got: {hdr_msg:?}"
+    );
+    let first_body = next_full_duplex_msg(&mut response_stream).await;
+    assert_eq!(
+        streamed_eos(&first_body),
+        Some(false),
+        "first chunk must propagate source EOS=false, got: {first_body:?}"
+    );
+
+    // Subsequent chunks: body responses only, never preceded by RequestHeaders,
+    // and each must propagate the source chunk's own end_of_stream flag.
+    for (chunk, &eos) in eos_flags.iter().enumerate().skip(1) {
+        let msg = next_full_duplex_msg(&mut response_stream).await;
+        assert_eq!(
+            streamed_eos(&msg),
+            Some(eos),
+            "chunk {chunk} should propagate source EOS={eos}, got: {msg:?}"
+        );
+    }
+}
+
+/// Extract `end_of_stream` from a streamed request-body response, if present.
+fn streamed_eos(msg: &ProcessingResponse) -> Option<bool> {
+    use praxis_proto::envoy::service::ext_proc::v3::body_mutation;
+    match msg.response.as_ref()? {
+        RespVariant::RequestBody(b) => match b.response.as_ref()?.body_mutation.as_ref()?.mutation.as_ref()? {
+            body_mutation::Mutation::StreamedResponse(s) => Some(s.end_of_stream),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Pull the next response from a `FULL_DUPLEX` stream with the shared timeout.
+async fn next_full_duplex_msg(stream: &mut tonic::Streaming<ProcessingResponse>) -> ProcessingResponse {
+    tokio::time::timeout(std::time::Duration::from_millis(TIMEOUT_MILLIS), stream.message())
+        .await
+        .expect("timed out waiting for response")
+        .expect("response stream error")
+        .expect("stream closed before response")
+}
+
+#[tokio::test]
 async fn full_duplex_response_body() {
     const MAX_CHUNKS: usize = 8;
     use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};

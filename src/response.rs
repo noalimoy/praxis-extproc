@@ -122,8 +122,9 @@ pub(crate) fn request_body(
     body: Option<&[u8]>,
     mutation: Option<HeaderMutation>,
     body_mode: BodyMode,
+    end_of_stream: bool,
 ) -> Vec<ProcessingResponse> {
-    body_responses(body, mutation, true, body_mode)
+    body_responses(body, mutation, true, body_mode, end_of_stream)
 }
 
 /// Build [`ProcessingResponse`] messages for the response body phase.
@@ -135,8 +136,9 @@ pub(crate) fn response_body(
     body: Option<&[u8]>,
     mutation: Option<HeaderMutation>,
     body_mode: BodyMode,
+    end_of_stream: bool,
 ) -> Vec<ProcessingResponse> {
-    body_responses(body, mutation, false, body_mode)
+    body_responses(body, mutation, false, body_mode, end_of_stream)
 }
 // -----------------------------------------------------------------------------
 // Trailer Responses
@@ -219,9 +221,10 @@ fn body_responses(
     mutation: Option<HeaderMutation>,
     is_request: bool,
     body_mode: BodyMode,
+    end_of_stream: bool,
 ) -> Vec<ProcessingResponse> {
     match body_mode {
-        BodyMode::FullDuplexStreamed => body_responses_streamed(body, mutation, is_request),
+        BodyMode::FullDuplexStreamed => body_responses_streamed(body, mutation, is_request, end_of_stream),
         BodyMode::None | BodyMode::Streamed | BodyMode::Buffered | BodyMode::BufferedPartial => {
             // BUFFERED mode (and others): use BodyMutation::Body for full replacement
             let body_mutation = body.filter(|b| !b.is_empty()).map(make_body_mutation);
@@ -247,18 +250,19 @@ fn make_body_mutation(data: &[u8]) -> BodyMutation {
 
 /// Build streamed body responses using `StreamedBodyResponse` wire format.
 ///
-/// Chunks the body at 62 KiB boundaries and returns responses.
-/// Each chunk is copied exactly once into its `ProcessingResponse`.
-///
-/// Even for empty bodies, `FULL_DUPLEX_STREAMED` mode requires
-/// `StreamedBodyResponse { body: [], end_of_stream: true }`.
+/// Chunks the body at 62 KiB boundaries and returns responses. Each chunk
+/// is copied exactly once into its `ProcessingResponse`. The `end_of_stream`
+/// flag is propagated from the source chunk and applied only to the final
+/// sub-chunk, so framing is preserved when Envoy splits a body across
+/// multiple messages. Empty bodies still emit one `StreamedBodyResponse`.
 fn body_responses_streamed(
     body: Option<&[u8]>,
     mut mutation: Option<HeaderMutation>,
     is_request: bool,
+    end_of_stream: bool,
 ) -> Vec<ProcessingResponse> {
     let Some(data) = body.filter(|b| !b.is_empty()) else {
-        return vec![make_streamed_response(&[], true, mutation, is_request)];
+        return vec![make_streamed_response(&[], end_of_stream, mutation, is_request)];
     };
 
     let mut responses = Vec::new();
@@ -266,7 +270,8 @@ fn body_responses_streamed(
 
     while offset < data.len() {
         let end = (offset + BODY_CHUNK_LIMIT).min(data.len());
-        let eos = end == data.len();
+        // Only the final sub-chunk is EOS, and only if the source chunk was.
+        let eos = end_of_stream && end == data.len();
         let chunk = data.get(offset..end).unwrap_or(&[]);
         let header_mut = if offset == 0 { mutation.take() } else { None };
 
@@ -423,7 +428,7 @@ mod tests {
 
     #[test]
     fn request_body_no_mutation() {
-        let responses = request_body(None, None, BodyMode::Buffered);
+        let responses = request_body(None, None, BodyMode::Buffered, true);
 
         assert_eq!(responses.len(), 1, "no body should produce one response");
     }
@@ -431,14 +436,14 @@ mod tests {
     #[test]
     fn request_body_with_data() {
         let data = vec![0_u8; 100];
-        let responses = request_body(Some(&data), None, BodyMode::Buffered);
+        let responses = request_body(Some(&data), None, BodyMode::Buffered, true);
 
         assert_eq!(responses.len(), 1, "should produce single body response");
     }
 
     #[test]
     fn response_body_no_mutation() {
-        let responses = response_body(None, None, BodyMode::Buffered);
+        let responses = response_body(None, None, BodyMode::Buffered, true);
 
         assert_eq!(responses.len(), 1, "no body should produce one response");
         assert!(
@@ -450,7 +455,7 @@ mod tests {
     #[test]
     fn response_body_with_data() {
         let data = vec![0_u8; 200];
-        let responses = response_body(Some(&data), None, BodyMode::Buffered);
+        let responses = response_body(Some(&data), None, BodyMode::Buffered, true);
 
         assert_eq!(responses.len(), 1, "should produce single body response");
         assert!(
@@ -510,7 +515,7 @@ mod tests {
             remove_headers: vec!["x-strip".to_owned()],
         };
         let data = vec![0_u8; 50];
-        let responses = request_body(Some(&data), Some(mutation), BodyMode::Buffered);
+        let responses = request_body(Some(&data), Some(mutation), BodyMode::Buffered, true);
 
         assert_eq!(responses.len(), 1, "should produce single body response with mutation");
     }
@@ -518,7 +523,7 @@ mod tests {
     #[test]
     fn large_body_single_response() {
         let data = vec![0_u8; BODY_CHUNK_LIMIT * 2 + 100];
-        let responses = request_body(Some(&data), None, BodyMode::Buffered);
+        let responses = request_body(Some(&data), None, BodyMode::Buffered, true);
 
         assert_eq!(
             responses.len(),
@@ -530,7 +535,7 @@ mod tests {
     #[test]
     fn request_body_includes_body_mutation() {
         let data = b"mutated body content";
-        let responses = request_body(Some(data), None, BodyMode::Buffered);
+        let responses = request_body(Some(data), None, BodyMode::Buffered, true);
 
         assert_eq!(responses.len(), 1, "should produce one response");
 
@@ -548,7 +553,7 @@ mod tests {
     #[test]
     fn response_body_includes_body_mutation() {
         let data = b"response body data";
-        let responses = response_body(Some(data), None, BodyMode::Buffered);
+        let responses = response_body(Some(data), None, BodyMode::Buffered, true);
 
         let body_mut = extract_body_mutation(&responses[0]);
         assert!(body_mut.is_some(), "response body_mutation should be populated");
@@ -556,7 +561,7 @@ mod tests {
 
     #[test]
     fn empty_body_has_no_body_mutation() {
-        let responses = request_body(Some(&[]), None, BodyMode::Buffered);
+        let responses = request_body(Some(&[]), None, BodyMode::Buffered, true);
 
         let body_mut = extract_body_mutation(&responses[0]);
         assert!(body_mut.is_none(), "empty body should not produce body_mutation");
@@ -564,7 +569,7 @@ mod tests {
 
     #[test]
     fn none_body_has_no_body_mutation() {
-        let responses = request_body(None, None, BodyMode::Buffered);
+        let responses = request_body(None, None, BodyMode::Buffered, true);
 
         let body_mut = extract_body_mutation(&responses[0]);
         assert!(body_mut.is_none(), "None body should not produce body_mutation");
@@ -573,7 +578,7 @@ mod tests {
     #[test]
     fn streamed_mode_single_chunk() {
         let data = vec![0_u8; 100];
-        let responses = request_body(Some(&data), None, BodyMode::FullDuplexStreamed);
+        let responses = request_body(Some(&data), None, BodyMode::FullDuplexStreamed, true);
 
         assert_eq!(responses.len(), 1, "small body should produce one streamed response");
 
@@ -593,7 +598,7 @@ mod tests {
     fn streamed_mode_multiple_chunks() {
         let size = BODY_CHUNK_LIMIT * 2 + 50;
         let data = vec![0_u8; size];
-        let responses = request_body(Some(&data), None, BodyMode::FullDuplexStreamed);
+        let responses = request_body(Some(&data), None, BodyMode::FullDuplexStreamed, true);
 
         assert_eq!(responses.len(), 3, "large body should produce three streamed responses");
 
@@ -623,7 +628,7 @@ mod tests {
             remove_headers: vec!["x-internal".to_owned()],
         };
         let data = vec![0_u8; BODY_CHUNK_LIMIT + 100];
-        let responses = request_body(Some(&data), Some(mutation), BodyMode::FullDuplexStreamed);
+        let responses = request_body(Some(&data), Some(mutation), BodyMode::FullDuplexStreamed, true);
 
         assert_eq!(responses.len(), 2, "should produce two streamed responses");
 
@@ -648,7 +653,7 @@ mod tests {
 
     #[test]
     fn streamed_mode_empty_body() {
-        let responses = request_body(Some(&[]), None, BodyMode::FullDuplexStreamed);
+        let responses = request_body(Some(&[]), None, BodyMode::FullDuplexStreamed, true);
 
         assert_eq!(responses.len(), 1, "empty body should produce one response");
 
@@ -670,9 +675,27 @@ mod tests {
     }
 
     #[test]
+    fn streamed_non_eos_chunk_is_not_marked_eos() {
+        // A non-final incoming chunk (end_of_stream=false) must never be
+        // reported as EOS, even after re-chunking at the 62 KiB boundary.
+        let data = vec![0_u8; BODY_CHUNK_LIMIT + 100];
+        let responses = request_body(Some(&data), None, BodyMode::FullDuplexStreamed, false);
+
+        assert_eq!(responses.len(), 2, "should re-chunk into two streamed responses");
+        for (i, resp) in responses.iter().enumerate() {
+            match extract_body_mutation(resp).unwrap() {
+                body_mutation::Mutation::StreamedResponse(s) => {
+                    assert!(!s.end_of_stream, "chunk {i} of a non-EOS message must not be EOS");
+                },
+                other => panic!("expected StreamedResponse variant, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn buffered_mode_preserves_behavior() {
         let data = vec![0_u8; BODY_CHUNK_LIMIT + 100];
-        let responses = request_body(Some(&data), None, BodyMode::Buffered);
+        let responses = request_body(Some(&data), None, BodyMode::Buffered, true);
 
         assert_eq!(responses.len(), 1, "BUFFERED mode should produce single response");
 
