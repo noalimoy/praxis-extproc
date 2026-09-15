@@ -131,9 +131,13 @@ async fn start_services(
     max_body: Option<usize>,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(run_with_sidecars(addrs, true, fips_active, server_cfg.metrics_auth.clone(), move |drain_rx| {
-        serve_grpc(addrs.0, pipeline, server_cfg, max_body, drain_rx)
-    }))
+    Box::pin(run_with_sidecars(
+        addrs,
+        true,
+        fips_active,
+        server_cfg.metrics_auth.clone(),
+        move |drain_rx| serve_grpc(addrs.0, pipeline, server_cfg, max_body, drain_rx),
+    ))
     .await
 }
 
@@ -145,10 +149,16 @@ async fn serve_unready(
     fips_active: bool,
     metrics_auth: config::MetricsAuthConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(run_with_sidecars(addrs, false, fips_active, metrics_auth, |drain_rx| async move {
-        wait_drain(drain_rx).await;
-        Ok(())
-    }))
+    Box::pin(run_with_sidecars(
+        addrs,
+        false,
+        fips_active,
+        metrics_auth,
+        |drain_rx| async move {
+            wait_drain(drain_rx).await;
+            Ok(())
+        },
+    ))
     .await
 }
 

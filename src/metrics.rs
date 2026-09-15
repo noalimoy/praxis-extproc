@@ -241,10 +241,10 @@ async fn accept_loop(
         tokio::select! {
             () = &mut shutdown => break,
             result = listener.accept() => {
-                let Ok((stream, _)) = result else {
-                    continue;
-                };
-                serve_connection(stream, handle.clone(), kube_client.clone());
+                match result {
+                    Ok((stream, _)) => serve_connection(stream, handle.clone(), kube_client.clone()),
+                    Err(e) => warn!(error = %e, "metrics accept error"),
+                }
             },
         }
     }
