@@ -79,12 +79,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pipeline = config::build_pipeline(&cfg, &registry);
 
     if cli.validate {
-        if let Some(reason) = fips_refusal(&fips, &registry) {
-            return Err(reason.into());
-        }
-        pipeline?;
-        info!("configuration is valid");
-        return Ok(());
+        return validate_config(&fips, &registry, pipeline);
     }
 
     let addrs = resolve_addresses(&cli, &cfg)?;
@@ -110,6 +105,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         praxis_extproc::fips::active(&fips),
     ))
     .await
+}
+
+/// Validate FIPS readiness and the configured filter pipeline, then exit.
+fn validate_config(
+    fips: &praxis_extproc::fips::Status,
+    registry: &praxis_filter::FilterRegistry,
+    pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(reason) = fips_refusal(fips, registry) {
+        return Err(reason.into());
+    }
+    pipeline?;
+    info!("configuration is valid");
+    Ok(())
 }
 
 /// Why this process must not serve under `PRAXIS_REQUIRE_FIPS`, if it must
