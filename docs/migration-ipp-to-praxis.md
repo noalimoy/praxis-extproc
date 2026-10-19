@@ -93,12 +93,21 @@ filter_chains:
       #    semantics tracked in #5.
       - filter: headers
         request_remove:
-          - X-MaaS-Internal   # strip inbound MaaS-owned headers
+          - X-MaaS-Internal                 # strip inbound MaaS-owned headers
 
       # 2. body-field-to-header (model-extractor)
-      #    ->  model_to_header  (full parity)
-      - filter: model_to_header
-        header: X-Gateway-Model-Name
+      #    ->  json_body request_extract (full parity;
+      #    see the promotion-header and spoofing notes below)
+      - filter: json_body
+        conditions:
+          - unless:                         # skip extraction when a prior hop
+              headers_present:              #   already set the routing header
+                - X-Gateway-Model-Name
+        request_extract:
+          - pointer: /model                 # IPP fieldName: model
+            header: X-Gateway-Model-Name    # IPP headerName
+        on_invalid: continue                # absent/invalid body -> pass through
+        max_body_bytes: 1048576             # core default is 10 MiB; size per workload
 
       # 3. model-provider-resolver  ->  intelligent_route
       #    K8s routing gap tracked in #5, #7. Candidates
@@ -144,7 +153,7 @@ filter_chains:
 
 | Go IPP plugin                                | Praxis filter                         | Parity                 | Gap tracked by |
 |----------------------------------------------|---------------------------------------|------------------------|----------------|
-| `body-field-to-header`                       | `model_to_header` / `json_body_field` | Full                   | —              |
+| `body-field-to-header`                       | `json_body` (`request_extract`)       | Full*                  | —              |
 | `maas-headers-guard`                         | `headers` + `when`/`unless`           | Partial                | [#5]           |
 | `model-provider-resolver`                    | `intelligent_route`                   | Partial (K8s)          | [#5], [#7]     |
 | `stream-usage-enforcer`                      | *(none yet)*                          | **None**               | [#44]          |
@@ -160,16 +169,64 @@ filter_chains:
 
 ### Per-plugin notes
 
-- **`body-field-to-header` → `model_to_header` /
-  `json_body_field`.** Full parity, but the target
-  depends on `fieldName`. `model_to_header` is the
-  shortcut for the common `fieldName: model` case
-  used in the profile above: it always promotes the
-  `model` field, so only `headerName` (→ `header`) is
-  configurable. For any other `fieldName`, use the
-  core `json_body_field` filter, which takes both
-  `field` (→ `fieldName`) and `header` (→ `headerName`)
-  and can promote an arbitrary body field.
+- **`body-field-to-header` → `json_body`.** The core
+  `json_body` filter promotes any body field with a
+  `request_extract` entry: `pointer` (→ `fieldName`,
+  as an RFC 6901 JSON Pointer such as `/model`) and
+  `header` (→ `headerName`). Set `on_invalid: continue`
+  to match IPP's pass-through on an absent or invalid
+  body. A single `json_body` filter can list multiple
+  `request_extract` entries and rewrite the body in
+  the same pass, so it supersedes the older
+  `model_to_header` and `json_body_field` filters.
+
+  **\*Promotion-header safety differs.** `model_to_header`
+  rejected unsafe target headers at config time —
+  transport (`host`, `content-length`), credential
+  (`authorization`, `x-api-key`, `cookie`), and
+  internal `x-praxis-*` names. `json_body` validates
+  only that the `header` name is syntactically valid;
+  it does **not** reject sensitive targets (that
+  guardrail lives in the `praxis-ai` promotion layer,
+  which core `json_body` cannot depend on). Because the
+  controller renders these configs, it must not emit a
+  `header` that targets a transport, credential, or
+  `x-praxis-*` name.
+
+  **\*Spoofing and the trust boundary.** The
+  `unless: headers_present` condition above skips extraction
+  when `X-Gateway-Model-Name` is already set, trusting a
+  value a prior hop in the chain placed there. Core
+  `json_body` otherwise only *writes* the header when the
+  pointer resolves: when `/model` is absent it skips
+  extraction, and with `on_invalid: continue` an unparseable
+  body passes through untouched — so it never *adds* the
+  header for an absent or invalid body, matching the old
+  `model_to_header` filter. Unlike `model_to_header`,
+  however, core `json_body` does **not** strip an inbound
+  client copy on its own.
+
+  If the request reaching this chain is not trusted, prevent
+  spoofing by dropping the condition and stripping the
+  header first with a `headers` filter
+  (`request_remove: [X-Gateway-Model-Name]`) immediately
+  before `json_body`:
+
+  ```yaml
+  - filter: headers
+    request_remove:
+      - X-Gateway-Model-Name
+  - filter: json_body
+    request_extract:
+      - pointer: /model
+        header: X-Gateway-Model-Name
+    on_invalid: continue
+  ```
+
+  Whichever you choose is a trust-boundary decision, not an
+  absolute guarantee: within a chain any filter can modify
+  both the header and the body, so place the strip where the
+  boundary actually is.
 - **`maas-headers-guard` → `headers`.** IPP captures
   inbound `x-maas-*` headers into request state for
   downstream plugins and guards them from
